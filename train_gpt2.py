@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import torch
 import math
+import time
 import torch.nn as nn
 from torch.nn import functional as F
 
@@ -11,6 +12,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head, self.n_embd = config.n_head, config.n_embd
         self.c_attn = nn.Linear(self.n_embd, 3*self.n_embd) #combines qkv
         self.c_proj = nn.Linear(self.n_embd, self.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
@@ -37,6 +39,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh') #approx only used for historical purposes of reproducing GPT-2, just using gelu works to remove flat relu gradient 0 problem, and modern LLMs use swiglu etc.
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -81,7 +84,26 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+        #weight sharing saving 30% params - LMhead (768 -> 50257, similar tokens have similar probability) behaves similarly to token embeddings (50257 -> 768, similar tokens have similar embedding)
+        self.transformer.wte.weight = self.lm_head.weight #makes the memory common, so now they're refering to same tensor.
+
+        #init params
+        self.apply(self._init_weights) #apply is a method of nn.module which iterates over modules and applies function passed
+
+    def _init_weights(self, module):
+        #Use GPT-2 initializations, layernorm is same as pytorch default so we dont change
+        #the 0.02 value is close to the value of xavier initialization, which is 1/sqrt(num_features) = 1/sqrt(768) ~ 0.03
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'): #We do this as residual stream variance will increase, so we normalize by 1/sqrt(num_layers)
+                std *= (2 * self.config.n_layer) ** -0.5 #here we do 2* because we have both attention block and mlp block applying in each 'layer'
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Context length is only {self.config.block_size}, cannot forward length {T}"
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) #positional indices
@@ -92,7 +114,10 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) #(B, T, vocab_size), each position has output of predicted next token. inefficient sampling
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) #logits: (B, T, vocab_size) -> (B*T, vocab_size) and targets (B, T) -> (B*T) 
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -143,26 +168,79 @@ class GPT(nn.Module):
 
         return model
 
+import tiktoken
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B, self.T = B, T
+
+        #load tokens at init
+        enc = tiktoken.get_encoding('gpt2')
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epcoh = {len(self.tokens) // (B*T)} batches")
+
+        #state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B*T+1]
+        x = (buf[:-1]).view(B, T)
+        y = (buf[1:]).view(B, T)
+        self.current_position += B*T
+        if self.current_position + B*T+1 > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
 #################################################################
 device = 'cpu'
 if torch.cuda.is_available():
     device = 'cuda'
 print(f'using device: {device}')
 
-num_return_sequences = 5
-max_length = 30
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
-model = GPT.from_pretrained('gpt2')
-model.eval()
+#get a data batch
+
+train_loader = DataLoaderLite(16, 1024)
+model = GPT(GPTConfig())
 model.to(device)
-print('loaded weights')
 
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #(8,) -> (1, 8) -> (5, 8)
-x = tokens.to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward() # adds to the existing gradients (+=), so make sure to zero_grad before this
+    optimizer.step() # updates paramters
+    if device=='cuda': torch.cuda.synchronize() #wait for the gpu to finish the above work before computing time on cpu below
+    t1 = time.time()
+    dt = (t1 - t0)*1000 #difference in milliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0) #objective measure of training speed (as we might change batch size etc.)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}") # .item gets the value out (on cpu) from loss tensor (on gpu)
+
+import sys; sys.exit(0)
+
+# model = GPT.from_pretrained('gpt2')
+# model.eval()
+# model.to(device)
+# print('loaded weights')
+
+# num_return_sequences = 5
+# max_length = 30
+# enc = tiktoken.get_encoding('gpt2')
+# tokens = enc.encode("Hello, I'm a language model")
+# tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #(8,) -> (1, 8) -> (5, 8)
+# x = tokens.to(device)
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
@@ -180,3 +258,39 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print(">", decoded)
+
+'''
+Train LOSSES
+Random - 10.82
+Initialization - 10.94
+50 batch optimization - 6.47
+'''
+
+'''
+STEPS 
+--- Model implementation
+implemented GPT module
+implemented Block incl MLP, SelfAttn
+implemented forward pass 
+sampling from logits
+--- Training
+convert text to batches of input, targets
+implement loss calculation
+overfit to 1 batch
+make a dataloader to optimize over batches
+--- Efficiency Improvements
+Weight sharing LMhead and token embedder
+Better initialization
+Lower precision training
+'''
+
+'''
+Important ideas
+1. Lower training precision helps optimize tensorflops, gpu memory limits, and gpu memory bandwidth. Latter 2 are particularly important because even in well-tuned applications
+we only end up utilizing tensor cores only 60%, rest time goes in data-fetching (memory bandwidth issue). Being able to store more in gpu memory means lesser fetches, and also
+more data/params can be fetched per second at lower precision.
+2. We can use even lower int8 precision in inference. We can't use for training because it is uniformly spaced which makes it difficult to model the normal distributions we want in training.
+3. Matrix multiplies are broken down into 4x4 multiplies at the low tensor-core level.
+4. TF32 just truncates the last 13 bits (out of 23) of mantissa precision, which makes matrix multiplies 8x faster. Cool thing is that the accumulator gives a fp32 output
+so nothing seems to have changed at the high-level, just internally the multiply is happening with tf32, loosing some precision which doesnt hurt DL
+'''
