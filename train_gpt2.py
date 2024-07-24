@@ -22,11 +22,13 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #(B, T, C) -> (B, T, nh, hs) -> (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #(B, T, C) -> (B, T, nh, hs) -> (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #(B, T, C) -> (B, T, nh, hs) -> (B, nh, T, hs)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # is now (B, nh, T, T)
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # is now (B, nh, T, T)
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         #contigous makes the order of elements in memory same as if tensor was made from scratch
         y = self.c_proj(y)
@@ -181,7 +183,7 @@ class DataLoaderLite:
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
         print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epcoh = {len(self.tokens) // (B*T)} batches")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
 
         #state
         self.current_position = 0
@@ -196,6 +198,15 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
+def get_lr(step):
+    if step < warmup_steps:
+        return (step+1) / max_steps * max_lr #step+1 so we don't start with lr 0 at step 0
+    elif step > max_steps:
+        return min_lr
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
 #################################################################
 device = 'cpu'
 if torch.cuda.is_available():
@@ -209,23 +220,54 @@ if torch.cuda.is_available():
 #get a data batch
 
 train_loader = DataLoaderLite(16, 1024)
-model = GPT(GPTConfig())
-model.to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+torch.set_float32_matmul_precision('high')
+# this makes matmuls 8x faster, which overall led to a 2x speedup (as other individual floats are still fp32, and we get channel/memory bound)
+
+model = GPT(GPTConfig(vocab_size=50304)) #this vocab_size adds extra unused (tiktoken has only 50257) tokens, but makes it 393*2^7 which improves matmulspeed.
+model.to(device)
+# model = torch.compile(model) 
+'''
+compiles the model code, to remove python interpreter overhead when forward passing model 
+and doing compiler optimizations since whole code can be known. 
+Also optimizes GPU read/writes as memory <> gpu round trips are quite time-taking for variables.
+Note:
+CPU memory - large (say 1Tb), slow to access
+GPU memory - smaller (say 40 gigs), faster to access
+GPU on-chip - tiny (say 20mb), extremely fast to access
+-- commented for now because pytorch 2.4 and earlier dont support compile with python 3.12
+'''
+
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95))
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        #only surround forward and loss acc to pytorch documentation. Goes to bfloat16 (exp8, mant7)
+        #autocast doesnt convert all functions to bfloat16, eg loss func calcs are precision sensitive so remain float32
+        logits, loss = model(x, y)
+        # import code; code.interact(local=locals()) #use to see dtype of logits,loss as a debugger
     loss.backward() # adds to the existing gradients (+=), so make sure to zero_grad before this
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) #gradient clipping, makes sure gradients don't spike/add instability
+    
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step() # updates paramters
+    
     if device=='cuda': torch.cuda.synchronize() #wait for the gpu to finish the above work before computing time on cpu below
     t1 = time.time()
     dt = (t1 - t0)*1000 #difference in milliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0) #objective measure of training speed (as we might change batch size etc.)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}") # .item gets the value out (on cpu) from loss tensor (on gpu)
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {step}, loss: {loss.item():.4f}, norm: {norm:.4f}, lr: {lr:.4e}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}") # .item gets the value out (on cpu) from loss tensor (on gpu)
 
 import sys; sys.exit(0)
 
@@ -267,6 +309,21 @@ Initialization - 10.94
 '''
 
 '''
+Optimization tok/sec throughputs
+Initial (batch size 16) - 19k
+With set_float32_matmul_precision - 29k
+With autocast - 39k
+With torch.compile(model) - couldnt run
+With flash attention - 100k :0
+vocab size = 2^7 * 393 (50304) - 107k
+'''
+
+'''
+Hyperparam Tuning Train losses
+beta 0.9, 0.95 + gradient clipping = 6.0
+'''
+
+'''
 STEPS 
 --- Model implementation
 implemented GPT module
@@ -281,7 +338,13 @@ make a dataloader to optimize over batches
 --- Efficiency Improvements
 Weight sharing LMhead and token embedder
 Better initialization
-Lower precision training
+Lower precision training (set matmul precision, autocast)
+Flash attention
+Nice numbers (maximize 2^x factor)
+--- Hyperparams
+Optimizer betas
+Gradient clipping
+CosineLR with linear warmup
 '''
 
 '''
