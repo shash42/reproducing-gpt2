@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import inspect
 import torch
 import math
 import time
@@ -170,6 +171,28 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nondecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        #we dont want to decay bias, layernorm etc, i.e. dim1 tensors
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nondecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nondecay_params = sum(p.numel() for p in nondecay_params)
+        print(f"num decayed paramter tensors: {len(decay_params)}, with {num_decay_params}")
+        print(f"num nondecayed paramter tensors: {len(nondecay_params)}, with {num_nondecay_params}")
+        
+        #fuse optimizer updates
+        fused_available = 'fused' in inspect.signature(torch.optim.Adam).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused Adam: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        
+        return optimizer
+
 import tiktoken
 
 class DataLoaderLite:
@@ -243,7 +266,9 @@ min_lr = max_lr * 0.1
 warmup_steps = 10
 max_steps = 50
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95))
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95))
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
 for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
@@ -316,11 +341,13 @@ With autocast - 39k
 With torch.compile(model) - couldnt run
 With flash attention - 100k :0
 vocab size = 2^7 * 393 (50304) - 107k
+fused adamW - 108k
 '''
 
 '''
 Hyperparam Tuning Train losses
 beta 0.9, 0.95 + gradient clipping = 6.0
+cosinelr schedule + weight decay 0.1 = 6.0
 '''
 
 '''
