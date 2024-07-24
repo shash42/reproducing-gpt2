@@ -242,7 +242,15 @@ if torch.cuda.is_available():
 
 #get a data batch
 
-train_loader = DataLoaderLite(16, 1024)
+total_batch_size = 2**19 #524,288 tokens
+B = 16 #micro-batch size
+T = 1024 #sequence length
+assert(total_batch_size % (B*T) == 0)
+grad_accum_steps = total_batch_size // (B*T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B, T)
 
 torch.set_float32_matmul_precision('high')
 # this makes matmuls 8x faster, which overall led to a 2x speedup (as other individual floats are still fp32, and we get channel/memory bound)
@@ -271,16 +279,21 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
 
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        #only surround forward and loss acc to pytorch documentation. Goes to bfloat16 (exp8, mant7)
-        #autocast doesnt convert all functions to bfloat16, eg loss func calcs are precision sensitive so remain float32
-        logits, loss = model(x, y)
-        # import code; code.interact(local=locals()) #use to see dtype of logits,loss as a debugger
-    loss.backward() # adds to the existing gradients (+=), so make sure to zero_grad before this
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            #only surround forward and loss acc to pytorch documentation. Goes to bfloat16 (exp8, mant7)
+            #autocast doesnt convert all functions to bfloat16, eg loss func calcs are precision sensitive so remain float32
+            logits, loss = model(x, y)
+            # import code; code.interact(local=locals()) #use to see dtype of logits,loss as a debugger
+            loss = loss / grad_accum_steps #scale the loss due to grad_accum and it would be divided more if batch size was larger due to reduction=mean
+            loss_accum += loss.detach()
+            loss.backward() # adds to the existing gradients (+=), so make sure to zero_grad before this
+    
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) #gradient clipping, makes sure gradients don't spike/add instability
     
     lr = get_lr(step)
@@ -291,8 +304,8 @@ for step in range(max_steps):
     if device=='cuda': torch.cuda.synchronize() #wait for the gpu to finish the above work before computing time on cpu below
     t1 = time.time()
     dt = (t1 - t0)*1000 #difference in milliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step}, loss: {loss.item():.4f}, norm: {norm:.4f}, lr: {lr:.4e}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}") # .item gets the value out (on cpu) from loss tensor (on gpu)
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / (t1 - t0)
+    print(f"step {step}, loss: {loss_accum.item():.4f}, norm: {norm:.4f}, lr: {lr:.4e}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}") # .item gets the value out (on cpu) from loss tensor (on gpu)
 
 import sys; sys.exit(0)
 
@@ -348,6 +361,7 @@ fused adamW - 108k
 Hyperparam Tuning Train losses
 beta 0.9, 0.95 + gradient clipping = 6.0
 cosinelr schedule + weight decay 0.1 = 6.0
+gradient accumalation
 '''
 
 '''
@@ -383,4 +397,6 @@ more data/params can be fetched per second at lower precision.
 3. Matrix multiplies are broken down into 4x4 multiplies at the low tensor-core level.
 4. TF32 just truncates the last 13 bits (out of 23) of mantissa precision, which makes matrix multiplies 8x faster. Cool thing is that the accumulator gives a fp32 output
 so nothing seems to have changed at the high-level, just internally the multiply is happening with tf32, loosing some precision which doesnt hurt DL
+5. Flash attention optimizes GPU read/write for attention matrix computation
+6. Gradient accumulation - Hyperparam values depend on batch size, and if we can't fit a large batch in memory, we can simulate it sequentially over multiple micro-batches
 '''
