@@ -15,7 +15,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(self.n_embd, 3*self.n_embd) #combines qkv
         self.c_proj = nn.Linear(self.n_embd, self.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
+        # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)) # not needed with flash attention
 
     def forward(self, x):
         B, T, C = x.size() #batches, sequence length, channels
@@ -325,6 +325,7 @@ max_steps = 19073 #10B // 2**19
 
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95))
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+enc = tiktoken.get_encoding('gpt2')
 
 for step in range(max_steps):
     t0 = time.time()
@@ -348,12 +349,40 @@ for step in range(max_steps):
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
 
+    if step > 0 and step % 100 == 0:
+        model.eval()
+        num_return_sequences = 3
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a language model")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #(8,) -> (1, 8) -> (5, 8)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank) #different seed for each process
+        
+        while xgen.size(1) < max_length:
+            with torch.no_grad():
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    logits, loss = model(xgen) #(5, T, vocab_size)    
+                logits = logits[:, -1, :] #we only care about prediction at last position
+                probs = F.softmax(logits, dim=-1)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                xcol = torch.gather(topk_indices, -1, ix) #get topk_indices[:}[ix]
+                xgen = torch.cat((xgen, xcol), dim=1)
+
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"rank {ddp_rank} sample {i}", decoded)
+
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) #sync gradients across processes, needed on forward too for some reason
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             #only surround forward and loss acc to pytorch documentation. Goes to bfloat16 (exp8, mant7)
             #autocast doesnt convert all functions to bfloat16, eg loss func calcs are precision sensitive so remain float32
@@ -386,36 +415,6 @@ if ddp:
 
 import sys; sys.exit(0)
 #torchrun --nproc_per_node=4 train_gpt2.py
-
-# model = GPT.from_pretrained('gpt2')
-# model.eval()
-# model.to(device)
-# print('loaded weights')
-
-# num_return_sequences = 5
-# max_length = 30
-# enc = tiktoken.get_encoding('gpt2')
-# tokens = enc.encode("Hello, I'm a language model")
-# tokens = torch.tensor(tokens, dtype=torch.long)
-# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #(8,) -> (1, 8) -> (5, 8)
-# x = tokens.to(device)
-
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x) #(5, T, vocab_size)
-        logits = logits[:, -1, :] #we only care about prediction at last position
-        probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        xcol = torch.gather(topk_indices, -1, ix) #get topk_indices[:}[ix]
-        x = torch.cat((x, xcol), dim=1)
-
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
 
 '''
 Train LOSSES
@@ -467,7 +466,9 @@ CosineLR with linear warmup
 --- Distributed Training
 DDP
 Tokenize data in parallel, sync and store in shards for better disk usage
-
+--- Validation
+Add validation loader, print intermediate loss
+Add intermediate generations
 '''
 
 '''
